@@ -1,8 +1,6 @@
-from typing import Any
-
 import torch as _torch
 import os as _os
-
+import threading as _threading
 import vulky as _vk
 import typing as _typing
 import enum as _enum
@@ -100,6 +98,7 @@ class _DeferredParametersManager:
     rdv_deferred_parameters_info = { }  # map each tuple of name_id and indices to { index: int, references: int } representing index and references count
     rdv_deferred_parameters_free_ids = []  # reusable ids for deferred parameters
     rdv_wrapped_tensors = {}  # wrapped tensors bound
+    rdv_wrapped_grads = {}  # wrapped grads created
 
     @classmethod
     def init(cls):
@@ -181,6 +180,8 @@ class _DeferredParametersManager:
             if t.requires_grad:
                 g = _vk.tensor_like(t)
                 _torch.zero_(g)
+                wgpu = _vk.wrap_gpu(g, 'inout')
+                cls.rdv_wrapped_grads[key_id] = wgpu
                 grad_data[key_id] = g.device_ptr  # valid for a vulkan tensor
                 grads[key] = g
         return grads
@@ -212,6 +213,15 @@ class deferred:
             return self
         return deferred(self._key, map_dim, self._indices)
 
+    @cached_property
+    def is_fixed(self) -> bool:
+        return self._map_dim is not None
+
+    @cached_property
+    def dimension(self) -> int:
+        assert self._map_dim is not None, "deferred parameter must be casted to a specific map dimension before."
+        return self._map_dim + len(self._indices)
+
     def __del__(self):
         if self._map_dim is not None:
             _DeferredParametersManager.free(self._key, self._map_dim, self._indices)
@@ -220,6 +230,7 @@ class deferred:
 def ensure_tensor(t: _typing.Union[_torch.Tensor, deferred], map_dim: int):
     if isinstance(t, _torch.Tensor):
         assert len(t.shape) == map_dim
+        assert not t.requires_grad, "Tensors bound directly can not require gradients. Use deferred parameters instead."
         return t
     else:
         assert isinstance(t, deferred)
@@ -274,7 +285,7 @@ class _DispatcherEngine(object):
     __EVAL_PIPELINES__ = {}  # From static signature to pipeline object
     __EVAL_MANAGERS__ = {}  # From dispatch signature to pipeline object
     __SYSTEM_BUFFER__ = None  # Object buffer with system values on it.
-    __RANDOMS__ = []
+    __RANDOMS__ = []  # Pre-generated randoms for system buffer
 
     @classmethod
     def generate_map_kernels(cls, compute_ids: _typing.Iterable[int]) -> (str, _typing.Set[str]):
@@ -352,21 +363,23 @@ class _DispatcherEngine(object):
         # Add buffer_reference definition with codename and map object layout
         code += f"#define RDV_CODENAME {codename}"
         code += f"""
-    layout(buffer_reference, scalar, buffer_reference_align=8) buffer MAP_BUFFER_NAME {{{map_object_parameters_code}}};
-    struct RDV_CODENAME {{ MAP_BUFFER_NAME data; }};
+    layout(buffer_reference, scalar, buffer_reference_align=8) buffer MAP_BUFFER_NAME(RDV_CODENAME) {{{map_object_parameters_code}}};
+    struct RDV_CODENAME {{ MAP_BUFFER_NAME(RDV_CODENAME) data; }};
     """
         for g, v in map.rdv_generics.items():
             code += f"#define {g} {v} \n"
         code += f"#define MAP_DECL in RDV_CODENAME _this \n"
         code += f"#define parameters _this.data \n"
-        code += f"#include \"./signatures.h\"\n"
+        code += f"#include \"system\\push_signatures.h\"\n"
 
         for s in map.rdv_dynamic_requires:  # Generate dynamic access code for all required signatures
             code += cls.create_code_for_dynamic_calls(map, *s)
 
         code += map.rdv_source_code + "\n"
 
-        code += f"#undef map_object\n"
+        code += f"#include \"system\\pop_signatures.h\"\n"
+
+        code += f"#undef MAP_DECL\n"
         code += f"#undef RDV_CODENAME\n"
         code += f"#undef parameters\n"
         for g in map.rdv_generics:
@@ -477,12 +490,12 @@ class _DispatcherEngine(object):
         return code
 
     @classmethod
-    def dispatch(cls, instance: 'Compute', task: 'ComputeTask', **deferred):
+    def dispatch(cls, instance: 'Compute', task: 'ComputeTask'):
         static_signature = (task.rdv_signature, task.rdv_group_size)
         pipeline, ds = cls.__EVAL_PIPELINES__.get(static_signature, (None, None))
         if pipeline is None: # Create Pipeline if no exist
             pipeline = _vk.pipeline_compute()
-            kernel_codes, kernel_dirs = cls.generate_map_kernels(task.binder._compute_ids())
+            kernel_codes, kernel_dirs = cls.generate_map_kernels(task.binder.dependences)
             compute_code = cls.generate_compute_kernel(instance, task)
             code = f"""
 #version 460
@@ -493,7 +506,7 @@ cls.create_support_code()
 #define LOCAL_SIZE_X {task.rdv_group_size[0]}
 #define LOCAL_SIZE_Y {task.rdv_group_size[1]}
 #define LOCAL_SIZE_Z {task.rdv_group_size[2]}
-            """ + __COMPUTE_TEMPLATE__ + kernel_codes + compute_code
+\n""" + __COMPUTE_TEMPLATE__ + "\n" + kernel_codes + "\n" + compute_code
             pipeline.load_shader_from_source(code, include_dirs=set([__INCLUDE_PATH__]+instance.rdv_include_dirs + list(kernel_dirs)))
             pipeline.layout(set=0, binding=0, system_buffer=_vk.DescriptorType.UNIFORM_BUFFER)
             pipeline.layout(set=0, binding=1, deferred_buffer=_vk.DescriptorType.STORAGE_BUFFER)
@@ -519,10 +532,6 @@ cls.create_support_code()
             manager.dispatch_threads(*task.rdv_threads, *task.rdv_group_size)
             manager.freeze()
             cls.__EVAL_MANAGERS__[dispatch_signature] = manager
-        # update system fields
-        # s = _generate_seeds()
-        import numpy as np
-        # r = _torch.randint(129, 1<<31, size=(4,))
         if len(cls.__RANDOMS__) == 0:
             cls.__RANDOMS__ = list(_torch.randint(129, 1 << 30, size=(1024*32, 4)))
         r = cls.__RANDOMS__.pop()
@@ -535,7 +544,6 @@ cls.create_support_code()
             b.dim_x = t[0]
             b.dim_y = t[1]
             b.dim_z = t[2]
-        # _DeferredParametersManager.bind(deferred)
         _vk.submit(manager)
 
     @classmethod
@@ -596,6 +604,7 @@ class _ComputeMeta(type):
         if extension_info is not None:  # is not an abstract node
             extension_path = extension_info.get('path', None)
             extension_code = extension_info.get('code', None)
+            stochastic = extension_info.get('stochastic', False)
             extension_generics = extension_info.get('generics', {})
             parameters = extension_info.get('parameters', {})
             assert (extension_path is None or isinstance(extension_path, str) and _os.path.isfile(
@@ -635,6 +644,7 @@ class _ComputeMeta(type):
                 _vk.LayoutAlignment.SCALAR,
                 description=from_type_2_layout_description(compute_object, s, **g)
             )
+            compute_type.rdv_stochastic = stochastic
             compute_type.rdv_layout_builder = compute_object_layout_builder
             compute_type.rdv_type_definition = compute_object
             compute_type.rdv_source_code = extension_code
@@ -648,6 +658,11 @@ class _MapMeta(_ComputeMeta):
     def __call__(self, *args, **kwargs):
         # map instantiation
         map_instance: Map = super(_MapMeta, self).__call__(*args, **kwargs)
+
+        param_requires_grad_generic = {'PARAMS_REQUIRES_GRAD': 1} if bool(map_instance.deferred_info) else {}
+        stochastic_generic = {'STOCHASTIC': 1} if map_instance.is_stochastic else {}
+         # update generics with param_requires_grad and stochastic
+        map_instance.rdv_generics = {**map_instance.rdv_generics, **param_requires_grad_generic, **stochastic_generic}
         if not map_instance.is_generic:
             assert all(not m.is_generic for m in map_instance.children), f'A non-generic map {type(map_instance)} can not contains generic submaps'
             compute_id = _DispatcherEngine.register_instance(map_instance)
@@ -660,9 +675,22 @@ class MapElement:
     def __init__(self,  type_definition, accessor):
         object.__setattr__(self, '_type_definition', type_definition)
         object.__setattr__(self, '_accessor', accessor)
+        object.__setattr__(self, '_deferreds_cache', {})
 
-    def _compute_ids(self) -> _typing.Iterable[int]:
+    def _compute_ids(self, deep=False) -> _typing.Iterable[int]:
         pass
+
+    @cached_property
+    def dependences(self):
+        return set(self._compute_ids(True))
+
+    def _deferreds(self) -> _typing.Dict[str, int]:
+        """
+        Returns a dict of deferred parameters used in this element.
+        key: name of the deferred parameter
+        value: dimension required for the tensor
+        """
+        return object.__getattribute__(self, '_deferreds_cache')
 
     def _references(self) -> _typing.Iterable['Map']:
         pass
@@ -674,18 +702,19 @@ class MapArray(MapElement):
         object.__setattr__(self, '_element_definition', type_definition[1])
         object.__setattr__(self, '_backend_array', [None] * type_definition[0])
 
-    def _compute_ids(self):
+    def _compute_ids(self, deep=False):
         element_definition = object.__getattribute__(self, '_element_definition')
         backend_array = object.__getattribute__(self, '_backend_array')
         if element_definition == Map:
             first_map: _typing.Optional[Map] = backend_array[0]
             assert first_map is not None and all(m.rdv_kernel_id == first_map.rdv_kernel_id for m in backend_array)
-            return (first_map.rdv_kernel_id,)
+            return (first_map.rdv_kernel_id, *(() if not deep else first_map.rdv_parameters._compute_ids(deep=True)))
         if isinstance(element_definition, dict) or isinstance(element_definition, list):
             first_element : _typing.Optional[MapElement] = backend_array[0]
-            cids = first_element._compute_ids()
-            assert first_element is not None and all(m._compute_ids() == cids for m in backend_array)
-            return cids
+            cids = first_element._compute_ids(deep)
+            ## TODO: check this in assignment
+            # assert first_element is not None and all(m._compute_ids() == cids for m in backend_array)
+            return cids # if not deep else first_element._compute_ids(deep=True)
         return ()
 
     def _references(self):
@@ -725,15 +754,33 @@ class MapArray(MapElement):
         element_definition = object.__getattribute__(self, '_element_definition')
         backend_array = object.__getattribute__(self, '_backend_array')
         accessor = object.__getattribute__(self, '_accessor')
+        deferreds_cache = object.__getattribute__(self, '_deferreds_cache')
         assert key >= 0 and key < len(backend_array)
         assert not isinstance(element_definition, list) and not isinstance(element_definition, dict)
-
+        is_deferrable = element_definition == DeferrableField
+        if is_deferrable and isinstance(value, deferred):
+            # Collect deferred parameters
+            assert value.is_fixed, "Deferred parameter must be casted to a specific map dimension before assignment."
+            if value._key in deferreds_cache:
+                assert deferreds_cache[value._key] == value.dimension, f"Deferred parameter {value._key} already assigned requiring different dimension {self._deferreds_cache[value._key]} vs {value.dimension}"
+            deferreds_cache[value._key] = value.dimension
         if accessor is not None:
             accessor_value = value
-            if element_definition == _torch.Tensor:
-                if not isinstance(value, _vk.GPUPtr):
-                    accessor_value = _vk.wrap_gpu(value, 'in')
-            accessor[key] = accessor_value
+            if is_deferrable:  # Special case for deferred fields
+                deferred_element = accessor[key]
+                if isinstance(value, _torch.Tensor):  # Directly bound
+                    deferred_element.data = _vk.wrap_gpu(value, 'in')
+                    for i, d in enumerate(value.shape):
+                        deferred_element.shape[i] = d
+                else:
+                    assert isinstance(value, deferred)
+                    deferred_element.data = _vk.DirectGPUPtr.null()
+                    deferred_element.deferred_index = value.id
+            else:
+                if element_definition == _torch.Tensor:
+                    if not isinstance(value, _vk.GPUPtr):
+                        accessor_value = _vk.wrap_gpu(value, 'in')
+                accessor[key] = accessor_value
         backend_array[key] = value
 
 
@@ -765,11 +812,18 @@ class MapStruct(MapElement):
     def __setattr__(self, key, value):
         type_definition = object.__getattribute__(self, '_type_definition')
         accessor = object.__getattribute__(self, '_accessor')
+        deferreds_cache = object.__getattribute__(self, '_deferreds_cache')
         assert key in type_definition
         field_definition = type_definition[key]
         is_deferrable = field_definition == DeferrableField
         assert not isinstance(field_definition, list), "Can not set directly a list, use per-index access"
         assert not isinstance(field_definition, dict) or is_deferrable, "Can not set directly an struct, use per-field access"
+        if is_deferrable and isinstance(value, deferred):
+            # Collect deferred parameters
+            assert value.is_fixed, "Deferred parameter must be casted to a specific map dimension before assignment."
+            if value._key in deferreds_cache:
+                assert deferreds_cache[value._key] == value.dimension, f"Deferred parameter {value._key} already assigned requiring different dimension {self._deferreds_cache[value._key]} vs {value.dimension}"
+            deferreds_cache[value._key] = value.dimension
         if accessor is not None:
             if is_deferrable:  # Special case for deferred fields
                 deferred_field = getattr(accessor, key)
@@ -789,7 +843,7 @@ class MapStruct(MapElement):
                 setattr(accessor, key, accessor_value)
         super().__setattr__(key, value)
 
-    def _compute_ids(self):
+    def _compute_ids(self, deep=False):
         type_definition = object.__getattribute__(self, '_type_definition')
         cids = []
         for key in type_definition:
@@ -800,8 +854,10 @@ class MapStruct(MapElement):
             if field_type == Map:
                 assert field_value is not None
                 cids.append(field_value.rdv_kernel_id)
+                if deep:
+                    cids.extend(field_value.rdv_parameters._compute_ids(True))
             elif isinstance(field_type, dict) or isinstance(field_type, list):
-                cids.extend(field_value._compute_ids())
+                cids.extend(field_value._compute_ids(deep))
         return tuple(cids)
 
     def _references(self):
@@ -833,6 +889,11 @@ class Map(object, metaclass=_MapMeta):
     """
     Gets the set of generics used by this map. All generics are turn into defines in the code that are
     only valid within the map implementation.
+    """
+    rdv_stochastic = False
+    """
+    Indicates if the map uses stochastic operations. 
+    Forward and backward passes will start with the same random seed.
     """
     rdv_dynamic_requires = {}
     """
@@ -879,13 +940,44 @@ class Map(object, metaclass=_MapMeta):
                  **generics):
         input_requires_grad_generic = { 'INPUT_REQUIRES_GRAD': 1 } if input_requires_grad else {}
         bw_uses_output_generic = { 'BW_USES_OUTPUT': 1 } if bw_uses_output else {}
-        self.rdv_generics = {**self.rdv_generics, **{k: v for k,v in generics.items() if v is not None}, **input_requires_grad_generic, **bw_uses_output_generic, 'INPUT_DIM': input_dim, 'OUTPUT_DIM': output_dim}
+        self.rdv_generics = {
+            **self.rdv_generics,
+            **{k: v for k,v in generics.items() if v is not None},
+            **input_requires_grad_generic,
+            **bw_uses_output_generic,
+            'INPUT_DIM': input_dim, 'OUTPUT_DIM': output_dim
+        }
         if not self.is_generic:
             layout = type(self).rdv_layout_builder(dynamic_length, self.rdv_generics)
             buffer = _vk.object_buffer(layout).clear()
             object.__setattr__(self, 'rdv_buffer', buffer)
             object.__setattr__(self, 'rdv_buffer_accessor', buffer.accessor)
             object.__setattr__(self, 'rdv_parameters', MapStruct(self.rdv_type_definition, buffer.accessor))
+        else:
+            object.__setattr__(self, 'rdv_parameters', MapStruct(self.rdv_type_definition, None))
+
+    @cached_property
+    def deferred_info(self) -> _typing.Dict[str, int]:
+        """
+        Returns a dict of deferred parameters used in this map and its children.
+        key: name of the deferred parameter
+        value: dimension required for the tensor
+        """
+        d = self.rdv_parameters._deferreds()
+        for c in self.children:
+            for k, v in c.deferred_info.items():
+                if k in d:
+                    assert v == d[k], f'Deferred parameter {k} has different required dimensions in map or child map.'
+                else:
+                    d[k] = v
+        return d
+
+    @cached_property
+    def is_stochastic(self) -> bool:
+        """
+        Indicates if the map or any of its children use stochastic operations.
+        """
+        return self.rdv_stochastic or any(child.is_stochastic for child in self.children)
 
     @cached_property
     def input_requires_grad(self) -> bool:
@@ -896,10 +988,7 @@ class Map(object, metaclass=_MapMeta):
         return 'BW_USES_OUTPUT' in self.rdv_generics
 
     def clone(self,
-              input_dim,
-              output_dim,
-              input_requires_grad,
-              bw_uses_output) -> 'Map':
+              **kwargs) -> 'Map':
         raise NotImplementedError()
 
     def cast(self,
@@ -932,7 +1021,7 @@ class Map(object, metaclass=_MapMeta):
         changed |= bw_uses_output != self.bw_uses_output
         s = self
         if changed:
-            s = self.clone(input_dim, output_dim, input_requires_grad, bw_uses_output)
+            s = self.clone(input_dim=input_dim, output_dim=output_dim, input_requires_grad=input_requires_grad, bw_uses_output=bw_uses_output)
         if promoting is None:
             return s
         return s.promote(promoting)
@@ -948,7 +1037,7 @@ class Map(object, metaclass=_MapMeta):
     @cached_property
     def rdv_signature(self):
         assert not self.is_generic, "Signatures represent uniquely a computation unit. Generic maps do not have signatures."
-        return (self.rdv_type_id, frozenset(self.rdv_generics.items()), self._compute_ids)
+        return (self.rdv_type_id, frozenset(self.rdv_generics.items()), self.rdv_parameters._compute_ids())
 
     def __getattr__(self, item):
         if item in self.rdv_type_definition:
@@ -998,7 +1087,7 @@ class Map(object, metaclass=_MapMeta):
         """
         Returns this map's dependencies compute ids as a set.
         """
-        return set(self._compute_ids)
+        return set(self.rdv_parameters._compute_ids(deep=True))
 
     @cached_property
     def children(self) -> _typing.Iterable['Map']:
@@ -1010,8 +1099,63 @@ class Map(object, metaclass=_MapMeta):
     def __call__(self, *args, **kwargs):
         assert not self.is_generic, "Cast the map to a specific dimensions before eval."
         input, = args
-        assert not input.requires_grad or self.input_requires_grad, "Cast the map to input_requires_grad=True before eval an input with grad req."
-        return _MapEvalFunction.apply(self, input, kwargs.keys(), *kwargs.values())
+        assert input.requires_grad == self.input_requires_grad, "Cast the map to input_requires_grad=input.requires_grad before eval an input with grad req."
+        for k, v in self.deferred_info.items():
+            assert k in kwargs, f"Missing deferred parameter {k} required by the map."
+            assert len(kwargs[k].shape) == v, f"Deferred parameter {k} must have dimension {v} as required by the map."
+        names = kwargs.keys()
+        deferred_tensors = kwargs.values()
+        assert len(self.deferred_info) == len(names) == len(deferred_tensors), "Deferred parameters must match the deferred parameters required by the map."
+        return _MapEvalFunction.apply(self, input, names, *deferred_tensors)
+
+    def __add__(self, other: 'MapLike') -> 'Map':
+        return AdditionMap(self, other, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def __radd__(self, other: 'MapLike') -> 'Map':
+        return AdditionMap(other, self, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def __sub__(self, other: 'MapLike') -> 'Map':
+        return SubtractionMap(self, other, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def __rsub__(self, other: 'MapLike') -> 'Map':
+        return SubtractionMap(other, self, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def __mul__(self, other: 'MapLike') -> 'Map':
+        return MultiplicationMap(self, other, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def __rmul__(self, other: 'MapLike') -> 'Map':
+        return MultiplicationMap(other, self, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def __truediv__(self, other: 'MapLike') -> 'Map':
+        return DivisionMap(self, other, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def __rtruediv__(self, other: 'MapLike') -> 'Map':
+        return DivisionMap(other, self, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def promote(self, dim: int):
+        return PromotedMap(
+            map=self,
+            input_dim=self.input_dim,
+            output_dim=dim,
+            input_requires_grad=self.input_requires_grad,
+            bw_uses_output=self.bw_uses_output
+        )
+
+    def then(self, outer: 'MapLike') -> 'Map':
+        outer = as_map(outer)
+        if isinstance(self, IdentityMap):
+            return outer.cast(input_dim=self.output_dim, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+        if isinstance(outer, IdentityMap):
+            return self.cast(output_dim=outer.output_dim)
+        return ComposeMap(self, outer, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+
+    def after(self, inner: 'MapLike') -> 'Map':
+        inner = as_map(inner)
+        if isinstance(self, IdentityMap):
+            return inner.cast(output_dim=self.input_dim, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
+        if isinstance(inner, IdentityMap):
+            return self.cast(input_dim=inner.input_dim)
+        return ComposeMap(inner, self, input_requires_grad=self.input_requires_grad, bw_uses_output=self.bw_uses_output)
 
     def backward(self,
                  input: _torch.Tensor,
@@ -1048,6 +1192,7 @@ class Compute(object, metaclass=_ComputeMeta):
     __extension_info__ = None  # Abstract node
     __instance__ = None
     __OBJECTS__ = { }  # from signature to binders
+    __LOCK__ = _threading.Lock()
 
     @classmethod
     def instance(cls):
@@ -1068,18 +1213,19 @@ class Compute(object, metaclass=_ComputeMeta):
 
     @classmethod
     def eval(cls, *args, deferred_parameters: _typing.Optional[_typing.Dict[str, _torch.Tensor]] = None, **kwargs):
-        if deferred_parameters is not None:
-            grads = _DeferredParametersManager.bind(deferred_parameters)
-        else:
-            grads = {}
-        instance = cls.instance()
-        compute_task = instance.bind(*args, **kwargs)
-        _DispatcherEngine.dispatch(instance, compute_task)
-        r = instance.result(compute_task)
-        if deferred_parameters is not None:
-            _DeferredParametersManager.unbind(deferred_parameters)
-            return r, grads
-        return r
+        with cls.__LOCK__:
+            if deferred_parameters is not None:
+                grads = _DeferredParametersManager.bind(deferred_parameters)
+            else:
+                grads = {}
+            instance = cls.instance()
+            compute_task = instance.bind(*args, **kwargs)
+            _DispatcherEngine.dispatch(instance, compute_task)
+            r = instance.result(compute_task)
+            if deferred_parameters is not None:
+                _DeferredParametersManager.unbind(deferred_parameters)
+                return r, grads
+            return r
 
     @classmethod
     def create_task(cls, threads: _typing.Union[int, tuple], *maps: Map, dynamic_size=0, group_size: tuple = (1024, 1, 1), **generics) -> ComputeTask:
@@ -1156,11 +1302,19 @@ class _MapBackwardEvalCompute(Compute):
     def bind(self, *args, **kwargs) -> ComputeTask:
         map, input, output_grad = args
         assert not map.is_generic
+        assert not map.bw_uses_output, "Backward eval can not be used with maps that use output in backward, cast to bw_uses_output=False."
         input_dim = input.shape[-1]
         output_dim = output_grad.shape[-1]
-        input_grad = _vk.tensor(*input.shape[:-1], input_dim)
+        input_grad = None if not input.requires_grad else _vk.zeros(*input.shape[:-1], input_dim)
         assert map.input_dim == input_dim and map.output_dim == map.output_dim
-        task = _MapBackwardEvalCompute.create_task(input.numel() // input_dim, map, MAP_INPUT_DIM=input_dim, MAP_OUTPUT_DIM=output_dim)
+        input_requires_grad_generics = {} if input_grad is None else {'INPUT_REQUIRES_GRAD': 1}
+        task = _MapBackwardEvalCompute.create_task(
+            input.numel() // input_dim,
+            map,
+            MAP_INPUT_DIM=input_dim,
+            MAP_OUTPUT_DIM=output_dim,
+            **input_requires_grad_generics
+        )
         binder = task.binder
         binder.input_tensor = _vk.wrap_gpu(input, 'in')
         binder.output_grad_tensor = _vk.wrap_gpu(output_grad, 'in')
@@ -1176,7 +1330,7 @@ class _MapBackwardEvalCompute(Compute):
 
 class _MapEvalFunction(_torch.autograd.Function):
     @staticmethod
-    def forward(ctx: Any, *args: Any, **kwargs: Any) -> Any:
+    def forward(ctx: _typing.Any, *args: _typing.Any, **kwargs: _typing.Any) -> _typing.Any:
         map, input, names, *deferred_tensors = args
         ctx.map = map
         ctx.names = names
@@ -1185,7 +1339,7 @@ class _MapEvalFunction(_torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+    def backward(ctx: _typing.Any, *grad_outputs: _typing.Any) -> _typing.Any:
         output_grad, = grad_outputs
         input, *deferred_tensors = ctx.saved_tensors
         map = ctx.map
@@ -1197,4 +1351,354 @@ class _MapEvalFunction(_torch.autograd.Function):
             None, # names
             *(grads.get(k) for k in names)
         )
+
+
+# Initialize the dispatcher engine
+_start_session()
+
+
+class ConstantMap(Map):
+    __extension_info__ = dict(
+        path=__INCLUDE_PATH__+"/map/map_const.h",
+        parameters=dict(
+            t=DeferrableField
+        )
+    )
+
+    def __init__(self, t: _typing.Union[_torch.Tensor, deferred], input_dim=None, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        if isinstance(t, _torch.Tensor):
+            assert len(t.shape) == 1
+            if output_dim is None:
+                output_dim = t.shape[0]
+            assert output_dim == t.shape[0]
+        super().__init__(input_dim=input_dim, output_dim=output_dim, input_requires_grad=input_requires_grad, bw_uses_output=bw_uses_output)
+        self.t = ensure_tensor(t, map_dim=1)
+
+    def clone(self, **kwargs) -> 'Map':
+        return ConstantMap(self.t, **kwargs)
+
+
+MapLike = _typing.Union[None, Map, int, float, _torch.Tensor, _typing.List[_typing.Any], _typing.Tuple[_typing.Any, ...]]
+"""
+Helper type for values that can be converted to a Map.
+"""
+
+
+ZERO = ConstantMap(_vk.tensor(1))
+
+
+def as_map(value: MapLike, *, default: MapLike = ZERO) -> Map:
+    """
+    Converts a value to a Map.
+    """
+    if value is None:
+        assert default is not None
+        value = default
+    if isinstance(value, Map):
+        return value
+    if isinstance(value, int) or isinstance(value, float):
+        t = _vk.tensor(1)
+        t[0] = value
+        return ConstantMap(t)
+    if isinstance(value, _vk.ViewTensor) and value.is_contiguous():
+        return ConstantMap(value)
+    if not isinstance(value, _torch.Tensor):
+        try:
+            value = _torch.as_tensor(value)
+        except:
+            raise TypeError(f'Type of value is not supported {type(value).__name__}')
+    assert value.requires_grad == False, "Can not create a constant map from a tensor requiring grad."
+    return ConstantMap(_vk.tensor_copy(value))
+
+
+# ============================
+#       Common Maps
+# ============================
+
+
+class PromotedMap(Map):
+    __extension_info__ = dict(
+        path=__INCLUDE_PATH__+"/map/map_promote.h",
+        parameters=dict(
+            map=Map,
+        )
+    )
+
+    def __init__(self,
+                 map: MapLike,
+                 input_dim=None,
+                 output_dim=None,
+                 input_requires_grad=False,
+                 bw_uses_output=False
+                 ):
+        map = as_map(map)
+        if map.input_dim is not None:
+            assert input_dim is None or map.input_dim == input_dim
+            input_dim = map.input_dim
+        assert map.output_dim is None or map.output_dim == 1
+        map = map.cast(input_dim, 1, input_requires_grad, bw_uses_output)
+        super().__init__(input_dim=input_dim, output_dim=output_dim, input_requires_grad=input_requires_grad, bw_uses_output=bw_uses_output)
+        self.map = map
+
+    def clone(self, **kwargs) -> 'Map':
+        return PromotedMap(
+            self.map,
+            **kwargs
+        )
+
+
+class IdentityMap(Map):
+    __extension_info__ = dict(
+        path=__INCLUDE_PATH__+"/map/map_identity.h"
+    )
+
+    def __init__(self, input_dim=None, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        if input_dim is None:
+            input_dim = output_dim
+        if output_dim is None:
+            output_dim = input_dim
+        assert input_dim == output_dim
+        super().__init__(input_dim=input_dim, output_dim=output_dim, input_requires_grad=input_requires_grad, bw_uses_output=bw_uses_output)
+
+    __instance__ = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls.__instance__ is None:
+            cls.__instance__ = IdentityMap()
+        return cls.__instance__
+
+    def clone(self,
+              **kwargs) -> 'Map':
+        return IdentityMap(**kwargs)
+
+
+class ComposeMap(Map):
+    __extension_info__ = dict(
+        path=__INCLUDE_PATH__+"/map/map_compose.h",
+        parameters=dict(
+            inner=Map,
+            outer=Map,
+        )
+    )
+
+    def __init__(self, inner: MapLike, outer: MapLike, input_dim=None, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        inner = as_map(inner, default=IdentityMap.get_instance())
+        outer = as_map(outer, default=IdentityMap.get_instance())
+        inner = inner.cast(input_dim=input_dim, output_dim=outer.input_dim, input_requires_grad=input_requires_grad, bw_uses_output=False)
+        inner_output_dim = inner.output_dim
+        outer = outer.cast(
+            input_dim=inner_output_dim if inner_output_dim is not None and inner_output_dim > 1 else None,
+            output_dim=output_dim,
+            input_requires_grad=True,
+            bw_uses_output=bw_uses_output
+        )
+        if inner.output_dim is None and outer.input_dim is not None:
+            inner = inner.cast(output_dim=outer.input_dim)
+        if inner.input_dim is not None and outer.output_dim is not None:
+            assert inner.output_dim is not None and outer.input_dim is not None, "Ambiguity for intermediate dimension during composing. Cast one of the two maps"
+        intermediate_dim_generics = {} if inner.is_generic or outer.is_generic else {'INTERMEDIATE_DIM' : inner.output_dim}
+        super().__init__(
+            input_dim=inner.input_dim,
+            output_dim=outer.output_dim,
+            input_requires_grad=input_requires_grad,
+            bw_uses_output=bw_uses_output,
+            **intermediate_dim_generics
+        )
+        self.inner = inner
+        self.outer = outer
+
+    def clone(self,
+              **kwargs) -> 'Map':
+        return ComposeMap(self.inner, self.outer, **kwargs)
+
+# ============================
+#       Map Operations
+# ============================
+
+
+class BinaryComponentwiseOperationMap(Map):
+    __extension_info__ = None   # abstract node
+    @classmethod
+    def create_info(cls, path: str):
+        return dict(
+            path=path,
+            parameters=dict(
+                map_a=Map,
+                map_b=Map,
+            )
+        )
+
+    @staticmethod
+    def _derive_signature(map_a, map_b):
+        input_dim = map_a.input_dim
+        if map_b.input_dim is not None:
+            assert input_dim is None or map_b.input_dim == input_dim
+        if map_a.output_dim == map_b.output_dim:
+            output_dim = map_a.output_dim
+        else:
+            if map_a.output_dim is None:
+                output_dim = map_b.output_dim if map_b.output_dim > 1 else None   # consider output 1 as generic still
+            else:
+                output_dim = map_a.output_dim if map_a.output_dim > 1 else None   # consider output 1 as generic still
+        return input_dim, output_dim
+
+    def __init__(self, map_a: MapLike, map_b: MapLike, submaps_bw_uses_output=None, input_dim=None, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        map_a = as_map(map_a, default=ZERO)
+        map_b = as_map(map_b, default=ZERO)
+        map_a = map_a.cast(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            input_requires_grad=input_requires_grad,
+            bw_uses_output=submaps_bw_uses_output
+        )
+        map_b = map_b.cast(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            input_requires_grad=input_requires_grad,
+            bw_uses_output=submaps_bw_uses_output
+        )
+        input_dim, output_dim = BinaryComponentwiseOperationMap._derive_signature(map_a, map_b)
+        map_a = map_a.cast(input_dim=input_dim, output_dim=output_dim)
+        map_b = map_b.cast(input_dim=input_dim, output_dim=output_dim)
+        super().__init__(input_dim=input_dim, output_dim=output_dim, input_requires_grad=input_requires_grad, bw_uses_output=bw_uses_output)
+        self.map_a = map_a
+        self.map_b = map_b
+
+    def clone(self, **kwargs) -> 'Map':
+        return type(self)(self.map_a, self.map_b, **kwargs)
+
+
+class AdditionMap(BinaryComponentwiseOperationMap):
+    __extension_info__ = BinaryComponentwiseOperationMap.create_info(
+        path=__INCLUDE_PATH__+"/map/map_op_add.h"
+    )
+
+    def __init__(self, map_a: MapLike, map_b: MapLike, input_dim=None, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        super().__init__(map_a, map_b, False, input_dim, output_dim, input_requires_grad, bw_uses_output)
+
+
+class SubtractionMap(BinaryComponentwiseOperationMap):
+    __extension_info__ = BinaryComponentwiseOperationMap.create_info(
+        path=__INCLUDE_PATH__+"/map/map_op_sub.h"
+    )
+
+    def __init__(self, map_a: MapLike, map_b: MapLike, input_dim=None, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        super().__init__(map_a, map_b, False, input_dim, output_dim, input_requires_grad, bw_uses_output)
+
+
+class MultiplicationMap(BinaryComponentwiseOperationMap):
+    __extension_info__ = BinaryComponentwiseOperationMap.create_info(
+        path=__INCLUDE_PATH__+"/map/map_op_mul.h"
+    )
+
+    def __init__(self, map_a: MapLike, map_b: MapLike, input_dim=None, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        super().__init__(map_a, map_b, True, input_dim, output_dim, input_requires_grad, bw_uses_output)
+
+
+class DivisionMap(BinaryComponentwiseOperationMap):
+    __extension_info__ = BinaryComponentwiseOperationMap.create_info(
+        path=__INCLUDE_PATH__+"/map/map_op_div.h"
+    )
+
+    def __init__(self, map_a: MapLike, map_b: MapLike, input_dim=None, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        super().__init__(map_a, map_b, True, input_dim, output_dim, input_requires_grad, bw_uses_output)
+
+
+class Sample1DMap(Map):
+    __extension_info__ = dict (
+        path=__INCLUDE_PATH__+"/map/map_sample_1d.h",
+        parameters=dict(
+            grid=DeferrableField
+        )
+    )
+
+    def __init__(self,
+                 grid: _typing.Union[_torch.Tensor, deferred],
+                 align_corners: bool = True,
+                 input_dim=1, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        if isinstance(grid, _torch.Tensor):
+            assert len(grid.shape) == 2
+            if output_dim is None:
+                output_dim = grid.shape[1]
+            assert output_dim == grid.shape[1]
+        assert input_dim == 1
+        align_corners_generic = {'ALIGN_CORNERS': 1} if align_corners else {}
+        super().__init__(input_dim=input_dim, output_dim=output_dim, input_requires_grad=input_requires_grad, bw_uses_output=bw_uses_output, **align_corners_generic)
+        self.grid = ensure_tensor(grid, map_dim=2)
+
+    @cached_property
+    def align_corners(self) -> bool:
+        return 'ALIGN_CORNERS' in self.rdv_generics
+
+    def clone(self,
+              **kwargs) -> 'Map':
+        return Sample1DMap(self.grid, align_corners=self.align_corners, **kwargs)
+
+
+class Sample2DMap(Map):
+    __extension_info__ = dict (
+        path=__INCLUDE_PATH__+"/map/map_sample_2d.h",
+        parameters=dict(
+            grid=DeferrableField
+        )
+    )
+
+    def __init__(self,
+                 grid: _typing.Union[_torch.Tensor, deferred],
+                 align_corners: bool = True,
+                 input_dim=2, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        if isinstance(grid, _torch.Tensor):
+            assert len(grid.shape) == 3
+            if output_dim is None:
+                output_dim = grid.shape[2]
+            assert output_dim == grid.shape[2]
+        assert input_dim == 2
+        align_corners_generic = {'ALIGN_CORNERS': 1} if align_corners else {}
+        super().__init__(input_dim=input_dim, output_dim=output_dim, input_requires_grad=input_requires_grad, bw_uses_output=bw_uses_output, **align_corners_generic)
+        self.grid = ensure_tensor(grid, map_dim=3)
+
+    @cached_property
+    def align_corners(self) -> bool:
+        return 'ALIGN_CORNERS' in self.rdv_generics
+
+    def clone(self,
+              **kwargs) -> 'Map':
+        return Sample2DMap(self.grid, align_corners=self.align_corners, **kwargs)
+
+
+class Sample3DMap(Map):
+    __extension_info__ = dict(
+        path=__INCLUDE_PATH__+"/map/map_sample_3d.h",
+        parameters=dict(
+            grid=DeferrableField
+        )
+    )
+
+    def __init__(self,
+                 grid: _typing.Union[_torch.Tensor, deferred],
+                 align_corners: bool = True,
+                 input_dim=3, output_dim=None, input_requires_grad=False, bw_uses_output=False):
+        if isinstance(grid, _torch.Tensor):
+            assert len(grid.shape) == 4
+            if output_dim is None:
+                output_dim = grid.shape[3]
+            assert output_dim == grid.shape[3]
+        assert input_dim == 3
+        align_corners_generic = {'ALIGN_CORNERS': 1} if align_corners else {}
+        super().__init__(input_dim=input_dim, output_dim=output_dim, input_requires_grad=input_requires_grad, bw_uses_output=bw_uses_output, **align_corners_generic)
+        self.grid = ensure_tensor(grid, map_dim=4)
+
+    @cached_property
+    def align_corners(self):
+        return 'ALIGN_CORNERS' in self.rdv_generics
+
+    def clone(self,
+              **kwargs) -> 'Map':
+        return Sample3DMap(self.grid, self.align_corners, **kwargs)
+
+
+# ============================
+#         Functions
+# ============================
 

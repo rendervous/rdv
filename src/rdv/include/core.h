@@ -579,13 +579,6 @@ float atomicAdd_f(float_ptr buf, int index, float value)
     #endif
 }
 
-#define PRINT debugPrintfEXT
-#ifdef ENABLE_ASSERT
-#define ASSERT(cond, message) if (!(cond)) debugPrintfEXT(message);
-#else
-#define ASSERT(cond, message) ;
-#endif
-
 /*
 ==================================
               TORCH
@@ -604,7 +597,7 @@ struct rdv_NamedTensorInfo {
     GPUPtr data;  // data_ptr of the bound tensor
     GPUPtr grad_data;  // data_ptr of the gradients of the bound tensor
     int dim; // dimension of the whole tensor. (indices + map_used_dim) should be equals dim
-    uint[8] shape; // shape of the whole tensor
+    uint[6] shape; // shape of the whole tensor
 };
 
 layout(set = 0, scalar, binding = 1, align=4) buffer DeferredParameterBuffer {
@@ -633,7 +626,7 @@ Tensor load_deferred(in DeferrableField p) {
         return t;
     }
     else {
-        Tensor t;
+        Tensor t = Tensor(0, 0, uint[6](0,0,0,0,0,0));
         rdv_DeferredParameterInfo dinfo = rdv_deferred_buffer.data[p.deferred_index];
         rdv_NamedTensorInfo ninfo = rdv_named_buffer.data[dinfo.name_id];
         if (ninfo.data == 0)  // null tensor
@@ -852,10 +845,17 @@ Surfel sample_surfel(in MeshInfo mesh, int index, vec2 baricentrics)
 ==================================
 */
 
-#define NOT_SUPPORTED PRINT("[Error] Not supported: Map with compute id: %d has not backward.", int_ptr(_this.data).data[0]);
+// #define CONCAT(a,b) a##b
+#define EXPAND(x) x
+#define NOT_SUPPORTED(msg) PRINT("[Error] Not supported (msg) in kernel {%d}.", int_ptr(_this.data).data[0]);
 #define ARRAY_SIZE(d) (d > 0 ? d : 1)
-#define MAP_BUFFER_NAME buffer_##RDV_CODENAME
-#define BUFFER(name) buffer_##RDV_CODENAME##_##name
+#define CONCAT(a, b) a##b
+#define CONCAT3(a,b,c) a##_##b##_##c
+#define HELPER_MAP_BUFFER_NAME(name) CONCAT(buffer_, name)
+#define MAP_BUFFER_NAME(name) EXPAND(HELPER_MAP_BUFFER_NAME(name))
+
+#define HELPER_BUFFER(name, codename) CONCAT3(buffer,codename,name)
+#define BUFFER(name) HELPER_BUFFER(name, RDV_CODENAME)
 #define BUFFER_DECL(name, size) layout(buffer_reference, scalar, buffer_reference_align=4) buffer BUFFER(name) { float data[size]; };
 
 //#define FORWARD void forward(MAP_DECL, in float _input[ARRAY_SIZE(INPUT_DIM)], out float _output[ARRAY_SIZE(OUTPUT_DIM)])
@@ -867,12 +867,8 @@ Surfel sample_surfel(in MeshInfo mesh, int index, vec2 baricentrics)
               Debug
 ==================================
 */
-
 #define PRINT debugPrintfEXT
-#ifdef ENABLE_ASSERT
 #define ASSERT(cond, message) if (!(cond)) debugPrintfEXT(message);
-#else
-#define ASSERT(cond, message) ;
-#endif
+
 
 #endif
